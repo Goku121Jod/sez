@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import json
 import random
+import asyncio
 import requests
 
 # Load config
@@ -14,8 +15,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Global data
 category_id = config["CATEGORY_ID"]
-developer_ids = config["DEVELOPER_IDS"]
-embed_color = config["EMBED_COLOR"]
+admin_ids = config["ADMIN_IDS"]
 
 channel_data = {}  # Stores channel-specific info like roles, amount, txid
 
@@ -24,6 +24,7 @@ channel_data = {}  # Stores channel-specific info like roles, amount, txid
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
     await bot.change_presence(activity=discord.Game(name="Auto MM"))
+    bot.loop.create_task(auto_check_transactions())
 
 
 @bot.event
@@ -42,6 +43,9 @@ async def on_message(message):
     if isinstance(message.channel, discord.TextChannel) and message.channel.category_id == category_id:
         await handle_channel_messages(message)
 
+    elif message.content.startswith("$release") and message.channel.category_id == category_id:
+        await handle_release_command(message)
+
 
 async def handle_channel_messages(message):
     channel = message.channel
@@ -53,31 +57,39 @@ async def handle_channel_messages(message):
             "roles": {},
             "amount": None,
             "txid": None,
-            "confirmed": {}
+            "confirmed": {},
+            "ltc_address": None,
+            "start_time": discord.utils.utcnow(),
+            "fee": 0.03
         }
 
-    # Developer ID check
+    # Developer ID check (any valid Discord user ID)
     try:
         dev_id = int(message.content.strip())
-        if dev_id in developer_ids:
-            added_user = bot.get_user(dev_id)
-            if not added_user:
-                await channel.send("User not found.")
-                return
+        added_user = bot.get_user(dev_id)
+        if not added_user:
+            await channel.send("User not found.")
+            return
 
-            await channel.send(f"{added_user.mention} has been added to the ticket!")
-            channel_data[channel.id]["users"].append(added_user.id)
+        # Give permissions
+        overwrites = channel.overwrites_for(added_user)
+        overwrites.read_messages = True
+        overwrites.send_messages = True
+        await channel.set_permissions(added_user, overwrite=overwrites)
 
-            # Send Crypto MM embed
-            embed = discord.Embed(title="Crypto MM", description="Welcome to our automated cryptocurrency Middleman system!", color=0x00ff00)
-            embed.set_footer(text="Created by: Exploit")
-            await channel.send(embed=embed)
+        await channel.send(f"{added_user.mention} has been added to the ticket!")
+        channel_data[channel.id]["users"].append(added_user.id)
 
-            # Warning embed
-            embed = discord.Embed(title="Please Read!", description="Ensure all deal conversations happen here.", color=0xff0000)
-            await channel.send(embed=embed)
+        # Send Crypto MM embed
+        embed = discord.Embed(title="Crypto MM", description="Welcome to our automated cryptocurrency Middleman system!", color=0x00ff00)
+        embed.set_footer(text="Created by: Exploit")
+        await channel.send(embed=embed)
 
-            await send_role_selection(channel)
+        # Warning embed
+        embed = discord.Embed(title="Please Read!", description="Ensure all deal conversations happen here.", color=0xff0000)
+        await channel.send(embed=embed)
+
+        await send_role_selection(channel)
 
     except ValueError:
         pass  # Skip if message isn't a valid dev ID
@@ -93,51 +105,132 @@ async def handle_channel_messages(message):
     elif message.content.isdigit() or '.' in message.content:
         try:
             amount = float(message.content)
-            channel_data[channel.id]["amount"] = amount
+            channel_data[channel.id]["amount"] = amount - 0.03  # Deduct fee
 
-            await channel.send(f"{message.author.mention} confirmed amount: ✅")
+            await send_deal_amount_confirmation(channel, amount)
 
-            await send_payment_invoice(channel)
         except ValueError:
             await channel.send("Invalid amount.")
 
-    elif message.content.lower() == "transaction detected":
-        api_key = open("apikey.txt").readline().strip()
-        ltc_address = random.choice(open("ltcaddy.txt").readlines()).strip()
+    elif message.content.lower() == "correct":
+        await channel.send(f"{message.author.mention} responded with 'Correct'")
+        await send_payment_invoice(channel)
 
-        tx_data = await check_ltc_transaction(api_key, ltc_address)
 
-        if tx_data["success"]:
-            channel_data[channel.id]["txid"] = tx_data["txid"]
-            await channel.send("✅ Payment received.")
-            await send_release_confirmation(channel)
-        else:
-            await channel.send("⚠️ Payment not detected yet.")
+async def handle_release_command(message):
+    if message.author.id not in admin_ids:
+        await message.channel.send("❌ You don’t have permission to use this command.")
+        return
 
-    elif message.content.lower() == "release":
-        receiver = next((u for u, r in channel_data[channel.id]["roles"].items() if r == "Receiver"), None)
-        sender = next((u for u, r in channel_data[channel.id]["roles"].items() if r == "Sender"), None)
+    ch_id = message.channel.id
+    if ch_id not in channel_data:
+        await message.channel.send("No active deal in this channel.")
+        return
 
-        if not receiver:
-            return
+    data = channel_data[ch_id]
+    if "amount" not in data:
+        await message.channel.send("Deal has not reached payment stage yet.")
+        return
 
-        await channel.send(f"<@{receiver}> Please send your LTC address to receive 5% of the amount.")
+    receiver = next((u for u, r in data["roles"].items() if r == "Receiver"), None)
+    if not receiver:
+        await message.channel.send("No Receiver found in this deal.")
+        return
 
-        def check(m):
-            return m.author == bot.get_user(receiver) and m.channel == channel
+    await message.channel.send(f"<@{receiver}> Please provide your Litecoin address.")
 
-        ltc_address = await bot.wait_for("message", check=check)
-        amount = channel_data[channel.id]["amount"]
-        reward_amount = amount * 0.05  # 5%
+    def check(m):
+        return m.author.id == receiver and m.channel == message.channel
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=120)
+        ltc_address = reply.content.strip()
+
+        # Release funds
+        from utils import send_ltc
+        wif_key = open("wifkey.txt").readline().strip()
+        amount_btc = data["amount"] / 856.3  # USD to BTC approx
+        txid = send_ltc(wif_key, ltc_address, amount_btc)
 
         embed = discord.Embed(title="Release Successful", color=0x00ff00)
-        embed.add_field(name="Address", value=f"`{ltc_address.content}`", inline=False)
-        embed.add_field(name="TXID", value=f"`{channel_data[channel.id]['txid']}`", inline=False)
-        embed.add_field(name="You Received", value=f"${reward_amount}", inline=False)
+        embed.add_field(name="Address", value=f"`{ltc_address}`", inline=False)
+        embed.add_field(name="TXID", value=f"`{txid}`", inline=False)
+        embed.add_field(name="You Received", value=f"${data['amount']:.2f}", inline=False)
+        await message.channel.send(embed=embed)
+
+        embed = discord.Embed(title="Deal Completed", description="Thank you for using the auto middleman service.", color=0x00ff00)
+        await message.channel.send(embed=embed)
+
+        del channel_data[ch_id]
+
+    except asyncio.TimeoutError:
+        await message.channel.send("⏰ No response received. Deal canceled.")
+        del channel_data[ch_id]
+
+
+async def auto_check_transactions():
+    """Background task that periodically checks for transactions"""
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        for ch_id, data in list(channel_data.items()):
+            channel = bot.get_channel(ch_id)
+
+            if data.get("amount") and not data.get("txid"):
+                ltc_address = data.get("ltc_address", random.choice(open("ltcaddy.txt").readlines()).strip())
+                channel_data[ch_id]["ltc_address"] = ltc_address
+
+                from sochain import check_ltc_transaction
+                tx_data = await check_ltc_transaction(ltc_address)
+
+                if tx_data["success"]:
+                    channel_data[ch_id]["txid"] = tx_data["txid"]
+                    await process_auto_release(channel, ch_id)
+
+            # Check for expired deals
+            start_time = data.get("start_time")
+            if start_time and (discord.utils.utcnow() - start_time).total_seconds() > 3600:  # 1 hour
+                await channel.send("⏰ This deal has expired due to inactivity.")
+                del channel_data[ch_id]
+
+        await asyncio.sleep(30)
+
+
+async def process_auto_release(channel, ch_id):
+    data = channel_data[ch_id]
+    receiver = next((u for u, r in data["roles"].items() if r == "Receiver"), None)
+
+    if not receiver:
+        return
+
+    await channel.send(f"<@{receiver}> Please provide your Litecoin address.")
+
+    def check(m):
+        return m.author.id == receiver and m.channel == channel
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=120)
+        ltc_address = reply.content.strip()
+
+        from utils import send_ltc
+        wif_key = open("wifkey.txt").readline().strip()
+        amount_btc = data["amount"] / 856.3  # USD to LTC approx
+        txid = send_ltc(wif_key, ltc_address, amount_btc)
+
+        embed = discord.Embed(title="Release Successful", color=0x00ff00)
+        embed.add_field(name="Address", value=f"`{ltc_address}`", inline=False)
+        embed.add_field(name="TXID", value=f"`{txid}`", inline=False)
+        embed.add_field(name="You Received", value=f"${data['amount']:.2f}", inline=False)
         await channel.send(embed=embed)
 
         embed = discord.Embed(title="Deal Completed", description="Thank you for using the auto middleman service.", color=0x00ff00)
         await channel.send(embed=embed)
+
+        del channel_data[ch_id]
+
+    except asyncio.TimeoutError:
+        await channel.send("⏰ Receiver did not respond. Deal canceled.")
+        del channel_data[ch_id]
 
 
 async def send_role_selection(channel):
@@ -186,13 +279,29 @@ async def send_confirmation(channel):
     await channel.send(embed=embed, view=view)
 
 
-async def send_payment_invoice(channel):
-    amount = channel_data[channel.id]["amount"]
-    ltc_address = random.choice(open("ltcaddy.txt").readlines()).strip()
+async def send_deal_amount_confirmation(channel, amount):
+    embed = discord.Embed(title="Deal Amount", color=0x00ff00)
+    embed.add_field(name="Sender", value=f"<@{channel_data[channel.id]['users'][0]}>", inline=False)
+    embed.add_field(name="Amount", value=f"${amount + 0.03:.2f} (Includes $0.03 Fee)", inline=False)
+    embed.add_field(name="Net to Receiver", value=f"${amount:.2f}", inline=False)
 
-    embed = discord.Embed(title="Payment Invoice", description="Send full amount to this address:", color=0x00ff00)
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Correct", style=discord.ButtonStyle.green, custom_id="correct"))
+    view.add_item(discord.ui.Button(label="Incorrect", style=discord.ButtonStyle.red, custom_id="incorrect"))
+
+    await channel.send(embed=embed, view=view)
+
+
+async def send_payment_invoice(channel):
+    amount = channel_data[channel.id]["amount"] + 0.03
+    ltc_address = random.choice(open("ltcaddy.txt").readlines()).strip()
+    channel_data[channel.id]["ltc_address"] = ltc_address
+
+    embed = discord.Embed(title="Payment Invoice", description="Please send the funds as part of the deal to the Middleman address specified below. To ensure the validation of your payment, please copy and paste the amount provided.", color=0x00ff00)
     embed.add_field(name="Litecoin Address", value=f"`{ltc_address}`", inline=False)
-    embed.add_field(name="Amount", value=f"${amount}", inline=True)
+    embed.add_field(name="LTC Amount", value=f"{amount / 856.3:.8f}", inline=True)
+    embed.add_field(name="USD Amount", value=f"${amount:.2f}", inline=True)
+    embed.add_field(name="Exchange Rate", value="1 LTC ≈ $856.30 USD", inline=False)
 
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Paste", custom_id="paste"))
@@ -201,23 +310,5 @@ async def send_payment_invoice(channel):
     await channel.send(embed=embed, view=view)
 
 
-async def check_ltc_transaction(api_key, address):
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/ {address}/balance?token={api_key}"
-    
-    try:
-        response = requests.get(url)
-        data = response.json()
-        
-        if data["balance"] > 0:
-            tx_url = f"https://api.blockcypher.com/v1/ltc/main/addrs/ {address}/full?token={api_key}"
-            tx_response = requests.get(tx_url)
-            tx_data = tx_response.json()
-
-            if tx_data.get("txs"):
-                txid = tx_data["txs"][0]["hash"]
-                return {"success": True, "txid": txid}
-        
-        return {"success": False}
-    
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+# Run the bot
+bot.run(config["BOT_TOKEN"])
